@@ -1,0 +1,8 @@
+PORT=5000
+JWT_SECRET=supersecretkey123
+DATABASE_URL="mongodb+srv"
+FRONTEND_URL="localhost:3000"
+ROOT_ADMIN_EMAIL="example@gmail.com"
+EMAIL_USERNAME="example@gmail.com"
+EMAIL_PASSWORD="dasa risa djas dghs"
+NODE_ENV="Development"

@@ -1,0 +1,787 @@
+openapi: 3.0.0
+info:
+  title: Water Galon API (UMKM Pro)
+  description: |
+    The complete backend API for the Indonesian Water Gallon Management System. This documentation details every endpoint, schema, and security measure.
+    
+    **Key Features:**
+    - 🔐 **Fortress Security:** 2FA, Fingerprinting, Sudo Mode, HttpOnly Cookies, Token Revocation.
+    - 🚚 **Indonesian Logistics:** Distance-based pricing, Weekly Schedules, After-hours order queuing, Manual WA orders.
+    - 💧 **Asset Tracking:** Full vs. Empty gallons, Customer-loaned bottles, Consumables (Caps/Tissues).
+    - 📊 **Big Data Analytics:** Financial breakdowns (Cash vs Debt), Customer Loyalty ("Langganan"), and Operational Heatmaps.
+  version: 1.0.0
+servers:
+  - url: http://localhost:5000/api
+    description: Local Development Server
+
+# ==========================================
+# Reusable Components (Schemas & Security)
+# ==========================================
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: token
+  
+  schemas:
+    # --- BASE SCHEMAS ---
+    ErrorResponse:
+      type: object
+      properties:
+        status: { type: string, example: "error" }
+        code: { type: string, example: "INVALID_INPUT" }
+        message: { type: string, example: "A specific error message." }
+
+    # --- INPUT SCHEMAS ---
+    LoginInput:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, example: "admin@water.com" }
+        password: { type: string, example: "password123" }
+        isAdmin: { type: boolean, default: false, description: "Set to true to attempt admin login." }
+        twoFactorCode: { type: string, description: "Required for Root Admin login after the initial 202 response." }
+
+    RegisterInput:
+      type: object
+      required: [name, email, password, metadata]
+      properties:
+        name: { type: string, example: "Pak Budi" }
+        email: { type: string, format: email, example: "budi@example.com" }
+        password: { type: string, minLength: 8, example: "newSecurePassword123" }
+        metadata:
+          type: object
+          required: [phone]
+          properties:
+            phone: { type: string, example: "081234567890" }
+            address:
+              type: object
+              properties:
+                street: { type: string, example: "Jl. Merdeka No. 45, RT 01/RW 02" }
+                coordinates: { type: object, properties: { lat: { type: number, example: -6.2088 }, lng: { type: number, example: 106.8456 } } }
+
+    PasswordUpdateInput:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword: { type: string }
+        newPassword: { type: string, minLength: 8 }
+
+    OrderInput:
+      type: object
+      required: [cartItems, paymentMethod, shippingInfo]
+      properties:
+        cartItems:
+          type: array
+          items:
+            type: object
+            properties:
+              productId: { type: string }
+              quantity: { type: integer, example: 2 }
+        shippingInfo:
+          type: object
+          properties:
+            fullAddress: { type: string }
+            phone: { type: string }
+        paymentMethod:
+          type: string
+          enum: [CASH, TRANSFER, KASBON]
+        distance:
+          type: number
+          description: "Distance in KM from shop (calculated by frontend Maps API)"
+          example: 4.2
+          
+    FeedbackInput:
+      type: object
+      required: [rating]
+      properties:
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        comment: { type: string }
+
+    SettingsInput:
+      type: object
+      properties:
+        isShopOpen: { type: boolean }
+        schedule: { type: array }
+        manualOverride: { type: object }
+        baseDeliveryFee: { type: number }
+        pricePerKm: { type: number }
+        features: { type: object }
+        loyaltyThreshold: { type: number }
+
+# --- GLOBAL SECURITY ---
+security:
+  - cookieAuth: []
+
+tags:
+  - name: Auth
+    description: "Authentication, Authorization, and User/Admin Management"
+  - name: Profile
+    description: "Endpoints for the currently logged-in user to manage their own profile"
+  - name: Products
+    description: "Public catalog and Admin-only product management"
+  - name: Orders
+    description: "Transaction lifecycle from creation to feedback"
+  - name: Admin
+    description: "High-level administrative functions: Settings, Analytics, Staff"
+  - name: Inventory
+    description: "Physical asset management: Gallons, Caps, Tissues"
+
+# ==========================================
+# API PATHS
+# ==========================================
+paths:
+  # --- AUTH ROUTES ---
+  /auth/register:
+    post:
+      summary: Register a New Customer Account
+      description: |
+        Creates a new user account with the 'user' role.
+        - **Phone number is mandatory** for delivery purposes.
+        - If an email is provided that belongs to a soft-deleted account, this endpoint will "resurrect" that account and update its details.
+      tags: [Auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterInput'
+      responses:
+        '201':
+          description: Registration successful. Returns user object and sets HttpOnly auth cookie.
+        '400':
+          description: Bad Request (e.g., email already in use, or missing phone number).
+
+  /auth/login:
+    post:
+      summary: Login User or Admin
+      description: |
+        Authenticates a user or admin.
+        - For Root Admin login, this may trigger a `202` response, requiring a second request with a `twoFactorCode`.
+        - A fingerprint-secured HttpOnly cookie is set upon success.
+      tags: [Auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginInput'
+      responses:
+        '200':
+          description: Login successful.
+        '202':
+          description: Accepted, but 2FA is required for the Root Admin.
+        '401':
+          description: Unauthorized. Invalid credentials.
+
+  /auth/logout:
+    get:
+      summary: Logout the Current User
+      description: Clears the authentication cookie, ending the session.
+      tags: [Auth]
+      responses:
+        '200':
+          description: Logout successful.
+
+  /auth/forgotPassword:
+    post:
+      summary: Request a Password Reset Link
+      description: If a user exists, an email is sent with a secure, time-limited token.
+      tags: [Auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { email: { type: string, format: email } } }
+      responses:
+        '200':
+          description: Confirmation message sent to prevent email enumeration.
+
+  /auth/resetPassword/{token}:
+    patch:
+      summary: Reset Password with Token
+      description: Uses the token from email to set a new password. The token is consumed.
+      tags: [Auth]
+      security: []
+      parameters:
+        - in: path
+          name: token
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { password: { type: string, minLength: 8 } } }
+      responses:
+        '200':
+          description: Password reset successfully. User is logged in.
+        '400':
+          description: Token is invalid or has expired.
+
+  # --- PROFILE ROUTES ---
+  /auth/updateMyPassword:
+    patch:
+      summary: Update My Password (Logged In)
+      description: Allows a currently authenticated user to change their password.
+      tags: [Profile]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordUpdateInput'
+      responses:
+        '200':
+          description: Password updated. New token issued.
+        '401':
+          description: The 'currentPassword' is incorrect.
+  
+  /auth/updateMe:
+    patch:
+      summary: Update My Profile Details
+      description: Allows a user to update their name, phone, address, and coordinates.
+      tags: [Profile]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                metadata: { type: object }
+      responses:
+        '200':
+          description: Profile updated.
+  
+  /auth/deleteMe:
+    delete:
+      summary: Deactivate My Account
+      description: Soft-deletes the user's account. Can be restored by registering again.
+      tags: [Profile]
+      responses:
+        '200':
+          description: Account deactivated.
+
+  # --- PRODUCTS ---
+  /products:
+    get:
+      summary: Get All Products (Public)
+      description: Retrieves a paginated list of all available (non-deleted) products.
+      tags: [Products]
+      security: []
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 12 }
+      responses:
+        '200':
+          description: A paginated list of products.
+    post:
+      summary: Create a New Product (Admin)
+      description: Adds a new product. Allows uploading up to 5 images.
+      tags: [Products]
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                productImages: { type: array, items: { type: string, format: binary } }
+                name: { type: string }
+                price: { type: number }
+                productType: { type: string, enum: [REFILL, NEW_BOTTLE, LOAN] }
+                'inventory[stock]': { type: integer }
+      responses:
+        '201':
+          description: Product created.
+  
+  /products/{id}:
+    get:
+      summary: Get a Single Product (Public)
+      description: Retrieves details for a specific product and increments `viewCount`.
+      tags: [Products]
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Product data.
+        '404':
+          description: Not Found.
+    put:
+      summary: General Product Update (Admin)
+      description: Updates any field of a product.
+      tags: [Products]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductInput'
+      responses:
+        '200':
+          description: Product updated.
+    delete:
+      summary: Soft Delete a Product (SUDO REQUIRED)
+      description: Moves a product to the "Trash". Requires Sudo Mode.
+      tags: [Products]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Product moved to trash.
+
+  /products/{id}/price:
+    put:
+      summary: Update Product Price (SUDO REQUIRED)
+      description: High-security endpoint for changing price. Requires Sudo Mode.
+      tags: [Products]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { price: { type: number } } }
+      responses:
+        '200':
+          description: Price updated.
+
+  /products/trash/all:
+    get:
+      summary: View Deleted Products (Admin)
+      description: Retrieves all products in the "Trash".
+      tags: [Products]
+      responses:
+        '200':
+          description: List of soft-deleted products.
+
+  /products/restore/{id}:
+    put:
+      summary: Restore a Product (Admin)
+      description: Restores a product from the "Trash".
+      tags: [Products]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Product restored.
+
+  # --- ORDERS ---
+  /orders:
+    get:
+      summary: Get Orders List
+      description: Users retrieve their own order history. Admins retrieve all orders.
+      tags: [Orders]
+      responses:
+        '200':
+          description: A paginated list of orders.
+    post:
+      summary: Create a New Order
+      description: Core business logic. Handles schedules, fees, inventory, loyalty, and queuing.
+      tags: [Orders]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderInput'
+      responses:
+        '201':
+          description: Order created.
+        '400':
+          description: Rejected (e.g., out of stock, shop closed).
+
+  /orders/manual:
+    post:
+      summary: Create Manual Order (Admin for WA/Phone)
+      description: Allows an admin to manually input an order from offline channels.
+      tags: [Orders]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                customerId: { type: string }
+                cartItems: { type: array }
+                paymentMethod: { type: string, enum: [CASH, TRANSFER, KASBON] }
+                notes: { type: string }
+      responses:
+        '201':
+          description: Manual order recorded.
+
+  /orders/{id}:
+    get:
+      summary: Get a Single Order
+      description: Retrieves details. A user can only access their own orders.
+      tags: [Orders]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Order details.
+        '403':
+          description: Forbidden.
+
+  /orders/{id}/cancel:
+    put:
+      summary: Cancel an Order
+      description: Cancels a 'PENDING' order and returns stock.
+      tags: [Orders]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Order cancelled.
+
+  /orders/{id}/feedback:
+    post:
+      summary: Submit Feedback for an Order
+      description: Submit rating, comment, and optional photo for a 'DELIVERED' order.
+      tags: [Orders]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                rating: { type: integer }
+                comment: { type: string }
+                reviewPhoto: { type: string, format: binary }
+      responses:
+        '200':
+          description: Feedback received.
+
+  /orders/{id}/upload-proof:
+    put:
+      summary: Upload Payment Proof
+      description: Uploads a receipt for 'TRANSFER' payment method.
+      tags: [Orders]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties: { paymentProof: { type: string, format: binary } }
+      responses:
+        '200':
+          description: Proof uploaded.
+
+  /orders/{id}/status:
+    put:
+      summary: Update Order Status (Admin)
+      description: Moves an order through its lifecycle.
+      tags: [Orders]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { status: { type: string, enum: [PREPARING, SHIPPING, DELIVERED, CANCELLED] } } }
+      responses:
+        '200':
+          description: Status updated.
+
+  /orders/{id}/verify:
+    put:
+      summary: Verify a Payment (Admin)
+      description: Approves or rejects a payment proof.
+      tags: [Orders]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { type: string, enum: [VERIFIED, REJECTED] }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Verification status updated.
+
+  # --- ADMIN & STAFF ---
+  /auth/sudo-verify:
+    post:
+      summary: Enter Sudo Mode
+      description: Grants a 10-minute "Golden Ticket" for high-risk actions.
+      tags: [Admin]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { password: { type: string } } }
+      responses:
+        '200':
+          description: Sudo Mode activated.
+  
+  /auth/users:
+    get:
+      summary: Get All Customers (Admin)
+      description: Retrieves a paginated list of all customers.
+      tags: [Admin]
+      responses:
+        '200':
+          description: List of users.
+
+  /auth/admins:
+    get:
+      summary: Get All Staff (Admin)
+      description: Retrieves a list of all staff. "Ghost" admins are hidden.
+      tags: [Admin]
+      responses:
+        '200':
+          description: List of staff.
+
+  /auth/create-staff:
+    post:
+      summary: Create New Staff Account (SUDO REQUIRED)
+      description: Creates a new account with the 'admin' role.
+      tags: [Admin]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                password: { type: string }
+                employeeId: { type: string }
+                isGhost: { type: boolean }
+      responses:
+        '201':
+          description: New staff account created.
+  
+  /auth/admin/{id}:
+    delete:
+      summary: Delete a Staff Account (SUDO REQUIRED)
+      description: Permanently deletes a staff account. Protected against self-deletion, last admin, and Root Admin.
+      tags: [Admin]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Staff account deleted.
+        '403':
+          description: Deletion forbidden by safety rules.
+
+  # --- HIGH-LEVEL ADMIN ---
+  /admin/analytics:
+    get:
+      summary: Get Dashboard Analytics
+      description: The 'Big Data' endpoint. Retrieves a summary of financials, operations, inventory, and customers.
+      tags: [Admin]
+      parameters:
+        - in: query
+          name: period
+          schema: { type: string, enum: [7d, 30d, 1y, all], default: 30d }
+      responses:
+        '200':
+          description: A detailed analytics object.
+
+  /admin/debt:
+    get:
+      summary: Get Kasbon (Debt) List
+      description: Retrieves all users with an outstanding debt balance.
+      tags: [Admin]
+      responses:
+        '200':
+          description: A list of debtors.
+
+  /admin/debt/settle:
+    post:
+      summary: Settle a User's Debt
+      description: Records a payment against a user's debt.
+      tags: [Admin]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { userId: { type: string }, amountPaid: { type: number } } }
+      responses:
+        '200':
+          description: Debt balance updated.
+
+  /admin/settings:
+    put:
+      summary: Update Global Store Settings (SUDO REQUIRED)
+      description: Modifies core business rules like fees, schedules, and features.
+      tags: [Admin]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettingsInput'
+      responses:
+        '200':
+          description: Global settings updated.
+
+  /admin/branding:
+    put:
+      summary: Update Site Logo and Banner
+      description: Uploads new branding images. Old ones are deleted.
+      tags: [Admin]
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                logo: { type: string, format: binary }
+                banner: { type: string, format: binary }
+                favicon: { type: string, format: binary }
+      responses:
+        '200':
+          description: Branding updated.
+  
+  /admin/emergency-toggle:
+    post:
+      summary: Emergency Open/Close Switch (SUDO REQUIRED)
+      description: The 'Panic Button' to immediately force the shop open or closed.
+      tags: [Admin]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                isOpen: { type: boolean }
+                message: { type: string }
+                reopenDate: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Emergency state toggled.
+          
+  /admin/logs:
+    get:
+      summary: Get Audit Logs (Admin)
+      description: Retrieves a paginated and filterable list of all admin actions recorded by the system.
+      tags: [Admin]
+      parameters:
+        - in: query
+          name: page
+          schema: {type: integer}
+        - in: query
+          name: limit
+          schema: {type: integer, default: 25}
+        - in: query
+          name: adminId
+          schema: {type: string}
+          description: "Filter logs by a specific admin's ID"
+        - in: query
+          name: action
+          schema: {type: string}
+          description: "Filter by action type (e.g., PRICE_CHANGE)"
+      responses:
+        '200':
+          description: A list of audit log entries.
+
+  # --- INVENTORY ---
+  /inventory/return-bottles:
+    post:
+      summary: Record Bottle Returns
+      description: Use when a user returns a loaned bottle.
+      tags: [Inventory]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { userId: { type: string }, quantity: { type: integer } }
+      responses:
+        '200':
+          description: Inventory updated.
+
+  /inventory/restock-supplies:
+    post:
+      summary: Restock Consumables
+      description: Adds to the inventory of caps and tissues.
+      tags: [Inventory]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { caps: { type: integer }, tissues: { type: integer } }
+      responses:
+        '200':
+          description: Supplies restocked.
+
+  /inventory/factory-refill:
+    post:
+      summary: Process Factory Refill (SUDO REQUIRED)
+      description: Swaps empty gallons for full ones in the inventory.
+      tags: [Inventory]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { quantity: { type: integer } } }
+      responses:
+        '200':
+          description: Asset swap completed.
+
+  /inventory/adjust:
+    post:
+      summary: Adjust for Loss/Shrinkage (SUDO REQUIRED)
+      description: Records lost or broken assets.
+      tags: [Inventory]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                type: { type: string, enum: [fullGallons, emptyGallons] }
+                quantity: { type: integer }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Inventory loss recorded.
